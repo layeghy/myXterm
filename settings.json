@@ -1,0 +1,11 @@
+{
+    "terminal": {
+        "font_family": "Consolas",
+        "font_size": 12,
+        "foreground_color": "#e1e1e1",
+        "background_color": "#363636"
+    },
+    "appearance": {
+        "theme": "light"
+    }
+}

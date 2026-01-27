@@ -1,0 +1,87 @@
+QMainWindow {
+    background-color: #2d2d30;
+}
+
+QWidget {
+    background-color: #2d2d30;
+    color: #f0f0f0;
+    font-family: "Segoe UI", sans-serif;
+}
+
+QSplitter::handle {
+    background-color: #3f3f46;
+}
+
+/* Sidebar */
+QTreeWidget {
+    background-color: #252526;
+    border: none;
+    color: #cccccc;
+}
+
+QTreeWidget::item:selected {
+    background-color: #37373d;
+}
+
+QTreeWidget::item:hover {
+    background-color: #2a2d2e;
+}
+
+/* Tabs */
+QTabWidget::pane {
+    border: 1px solid #3f3f46;
+    background-color: #1e1e1e;
+}
+
+QTabBar::tab {
+    background-color: #2d2d30;
+    color: #cccccc;
+    padding: 8px 15px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    margin-right: 2px;
+}
+
+QTabBar::tab:selected {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    border-top: 2px solid #007acc;
+}
+
+QTabBar::tab:hover {
+    background-color: #3e3e42;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #3e3e42;
+    border: 1px solid #3f3f46;
+    color: #ffffff;
+    padding: 5px 15px;
+    border-radius: 3px;
+}
+
+QPushButton:hover {
+    background-color: #505055;
+}
+
+QPushButton:pressed {
+    background-color: #007acc;
+}
+
+/* Inputs */
+QLineEdit, QSpinBox {
+    background-color: #3e3e42;
+    border: 1px solid #3f3f46;
+    color: #ffffff;
+    padding: 4px;
+    selection-background-color: #264f78;
+}
+
+QDialog {
+    background-color: #2d2d30;
+}
+
+QLabel {
+    color: #f0f0f0;
+}

@@ -1,0 +1,24 @@
+# Python stuff
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Build and Dist
+build/
+dist/
+*.spec
+
+# Application specific
+secret.key
+sessions.json
+*.json.bak
+*.log
+log.txt
+session_debug.log
+
+# IDEs
+.vscode/
+.idea/
+.gemini/
