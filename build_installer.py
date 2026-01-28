@@ -9,7 +9,7 @@ def build_installer():
     # Files
     sessions_file = "sessions.json"
     backup_file = "sessions.json.bak"
-    pyinstaller_path = os.path.join("venv", "Scripts", "pyinstaller.exe")
+    pyinstaller_path = os.path.join(".venv", "Scripts", "pyinstaller.exe")
     
     # Icon handling
     icon_png = os.path.join("build", "resources", "icon.png")
@@ -47,7 +47,16 @@ def build_installer():
         with open(sessions_file, "w") as f:
             f.write("[]")
             
-        # 3. Build Main Application
+        # 3. Clean and Build Main Application
+        print("Cleaning dist and build directories...")
+        for folder in ["dist", "build/myXterm"]:
+            if os.path.exists(folder):
+                try:
+                    shutil.rmtree(folder)
+                except Exception as e:
+                    print(f"Warning: Could not clean {folder}: {e}")
+                    print("Make sure no instances of the application are running!")
+
         print("Building Main Application (myXterm.exe)...")
         # Use simple command to build from spec file
         # The spec file handles all data, hidden imports, and icon settings
@@ -56,7 +65,14 @@ def build_installer():
             "--clean",
             "myXterm.spec" 
         ]
-        subprocess.check_call(cmd_app)
+        try:
+            subprocess.check_call(cmd_app)
+        except subprocess.CalledProcessError as e:
+            if "Permission denied" in str(e) or "dist\\myXterm.exe" in str(e):
+                print("\nERROR: Permission denied when writing to dist/myXterm.exe.")
+                print("THIS USUALLY MEANS myXterm.exe IS STILL RUNNING.")
+                print("PLEASE CLOSE ALL INSTANCES AND TRY AGAIN.")
+            raise
         
         # Verify main app exists
         main_exe = os.path.join("dist", "myXterm.exe")

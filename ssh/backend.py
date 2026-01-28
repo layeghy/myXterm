@@ -3,7 +3,7 @@ import threading
 import time
 
 class SSHSession:
-    def __init__(self, host, port, username, password=None, key_filename=None, proxy_settings=None, proxy_jump_settings=None, auth_callback=None):
+    def __init__(self, host, port, username, password=None, key_filename=None, proxy_settings=None, proxy_jump_settings=None, auth_callback=None, password_callback=None):
         self.host = host
         self.port = port
         self.username = username
@@ -12,12 +12,100 @@ class SSHSession:
         self.proxy_settings = proxy_settings
         self.proxy_jump_settings = proxy_jump_settings
         self.auth_callback = auth_callback
+        self.password_callback = password_callback
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.shell = None
         self.running = False
         self.jump_client = None # Keep reference to jump client
         self.jump_transport = None
+
+    def _smart_interactive_callback(self, title, instructions, prompt_list, username, password):
+        """
+        Callback wrapper that automatically satisfies the first 'Password' prompt 
+        using stored credentials, otherwise falls back to the UI callback.
+        """
+        print(f"DEBUG: Smart interactive callback for {username} - Prompts: {[p[0] for p in prompt_list]}")
+        
+        # If we have a password and this looks like a password prompt, try to use it
+        responses = []
+        for prompt, echo in prompt_list:
+            p_lower = prompt.lower()
+            if password and ("password" in p_lower or "passcode" in p_lower) and not getattr(self, '_sent_initial_password', False):
+                print(f"DEBUG: Auto-injecting stored password for prompt: {prompt}")
+                responses.append(password)
+                self._sent_initial_password = True
+            elif self.auth_callback:
+                # Fallback to UI
+                print(f"DEBUG: Falling back to UI for prompt: {prompt}")
+                ui_responses = self.auth_callback(title, instructions, [(prompt, echo)])
+                if ui_responses:
+                    responses.append(ui_responses[0])
+                else:
+                    responses.append("")
+            else:
+                responses.append("")
+        return responses
+
+    def _authenticate(self, transport, username, password):
+        """Helper to handle authentication (Smart Interactive -> Password fallback)"""
+        try:
+            if not transport.is_active():
+                print(f"Auth Error: Transport for {username} is not active")
+                return False
+
+            self._sent_initial_password = False
+            
+            # 1. Try Smart Interactive first (MFA)
+            print(f"Authenticating {username} (interactive/MFA)...")
+            try:
+                # We use a lambda to pass our stateful wrapper
+                callback = lambda t, i, p: self._smart_interactive_callback(t, i, p, username, password)
+                transport.auth_interactive(username, callback)
+                if transport.is_authenticated():
+                    print(f"Auth Success: Interactive auth for {username}")
+                    return True
+            except paramiko.auth_handler.AuthenticationException as e:
+                if "partial" in str(e).lower():
+                     print(f"Auth Partial: Further factors required for {username}")
+                else:
+                     print(f"Auth Failed: Interactive auth for {username}: {e}")
+            except Exception as e:
+                print(f"Auth Error: Interactive auth for {username}: {e}")
+
+            # 2. Try standard password auth fallback
+            if not transport.is_authenticated():
+                current_password = password
+                attempts = 0
+                while attempts < 2:
+                    if current_password:
+                        print(f"Authenticating {username} (password fallback, attempt {attempts+1})...")
+                        try:
+                            transport.auth_password(username, current_password)
+                            if transport.is_authenticated():
+                                print(f"Auth Success: Password auth for {username}")
+                                if username == self.username:
+                                    self.password = current_password
+                                return True
+                        except paramiko.auth_handler.AuthenticationException:
+                            print(f"Auth Failed: Password auth for {username}")
+                        except Exception as e:
+                            print(f"Auth Error: Password auth for {username}: {e}")
+                    
+                    if self.password_callback and not transport.is_authenticated():
+                        new_pass = self.password_callback(f"Authentication failed for {username}@{self.host}. Please enter a new password:")
+                        if new_pass:
+                            current_password = new_pass
+                            attempts += 1
+                        else:
+                            break
+                    else:
+                        break
+            
+            return transport.is_authenticated()
+        except Exception as e:
+            print(f"Critical Auth Error for {username}: {e}")
+            return False
 
     def connect(self):
         try:
@@ -32,27 +120,11 @@ class SSHSession:
                 
                 print(f"Connecting to jump host: {jump_user}@{jump_host}:{jump_port}")
                 
-                # Use Transport directly for granular auth control (MFA)
                 self.jump_transport = paramiko.Transport((jump_host, jump_port))
                 self.jump_transport.start_client()
                 
-                authenticated = False
-                try:
-                    # Try password first
-                    self.jump_transport.auth_password(username=jump_user, password=jump_pass)
-                    authenticated = True
-                except paramiko.AuthenticationException:
-                    # Fallback to interactive/MFA if password fails or is partial
-                    if self.auth_callback:
-                        print("Password auth failed/partial, trying interactive (MFA)...")
-                        try:
-                            self.jump_transport.auth_interactive(username=jump_user, handler=self.auth_callback)
-                            authenticated = True
-                        except Exception as e:
-                            print(f"Interactive auth failed: {e}")
-                
-                if not authenticated:
-                    raise Exception("Jump host authentication failed")
+                if not self._authenticate(self.jump_transport, jump_user, jump_pass):
+                    raise Exception(f"Jump host authentication failed for {jump_user}@{jump_host}")
 
                 # Create a channel to the target
                 print(f"Opening channel to target: {self.host}:{self.port}")
@@ -62,20 +134,56 @@ class SSHSession:
                     ("127.0.0.1", 0) 
                 )
 
-            self.client.connect(
-                self.host,
-                port=self.port,
-                username=self.username,
-                password=self.password,
-                key_filename=self.key_filename,
-                sock=sock # Pass the channel as the socket
-            )
-            self.shell = self.client.invoke_shell()
+            # Main Connection
+            # Try high-level connect first. 
+            print(f"Connecting to target host: {self.username}@{self.host}:{self.port}")
+            try:
+                self.client.connect(
+                    self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    key_filename=self.key_filename,
+                    sock=sock,
+                    allow_agent=True,
+                    look_for_keys=True,
+                    timeout=15
+                )
+                self.shell = self.client.invoke_shell()
+                print(f"DEBUG: High-level connect successful for {self.host}")
+            except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+                print(f"DEBUG: High-level connect failed or needs MFA: {e}. Trying robust manual fallback...")
+                
+                # IMPORTANT: If connect failed, the previous socket/channel is often corrupted/closed.
+                # We should close it and open a NEW one if we're using a jump host.
+                if sock:
+                    try: sock.close()
+                    except: pass
+                    print("DEBUG: Opening NEW channel to target via jump host for MFA fallback...")
+                    sock = self.jump_transport.open_channel("direct-tcpip", (self.host, self.port), ("127.0.0.1", 0))
+                
+                # Create a fresh transport
+                if sock:
+                    transport = paramiko.Transport(sock)
+                else:
+                    transport = paramiko.Transport((self.host, self.port))
+                
+                transport.start_client()
+                
+                if not self._authenticate(transport, self.username, self.password):
+                    transport.close()
+                    raise Exception(f"Target host authentication failed for {self.username}@{self.host}")
+                
+                # Success! Manual session setup.
+                self.shell = transport.open_session()
+                self.shell.get_pty()
+                self.shell.invoke_shell()
+                print(f"DEBUG: Manual transport auth successful for {self.host}")
+
             self.running = True
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
-            # Clean up jump transport if main connection failed
             if self.jump_transport:
                 self.jump_transport.close()
                 self.jump_transport = None
@@ -98,7 +206,17 @@ class SSHSession:
 
     def close(self):
         self.running = False
-        if self.client:
-            self.client.close()
-        if self.jump_client:
-            self.jump_client.close()
+        print("DEBUG: Closing SSH session...")
+        try:
+            if self.shell:
+                self.shell.close()
+            if self.client:
+                self.client.close()
+            if self.jump_transport:
+                self.jump_transport.close()
+                self.jump_transport = None
+            if self.jump_client:
+                self.jump_client.close()
+                self.jump_client = None
+        except Exception as e:
+            print(f"DEBUG: Error during close: {e}")

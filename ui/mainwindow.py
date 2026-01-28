@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QMainWindow, QSplitter, QTabWidget, QWidget, QVBoxLayout, QMessageBox, QFileDialog, QInputDialog, QLineEdit
+from PyQt6.QtWidgets import QMainWindow, QSplitter, QTabWidget, QWidget, QVBoxLayout, QMessageBox, QFileDialog, QInputDialog, QLineEdit, QToolBar
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt, pyqtSignal
 from .sidebar import Sidebar
@@ -12,7 +12,8 @@ import threading
 class MainWindow(QMainWindow):
     session_connected = pyqtSignal(object, str) # session, host
     session_failed = pyqtSignal(str) # error message
-    mfa_requested = pyqtSignal(str, object) # prompt, event_container
+    mfa_requested = pyqtSignal(str, str, str, bool, object) # title, instructions, prompt, echo, event_container
+    password_requested = pyqtSignal(str, object) # prompt, event_container
 
     def __init__(self):
         super().__init__()
@@ -25,6 +26,9 @@ class MainWindow(QMainWindow):
         
         # Menu Bar
         self.create_menu_bar()
+        
+        # Toolbar
+        self.create_toolbar()
         
         # Main Layout
         self.central_widget = QWidget()
@@ -58,6 +62,7 @@ class MainWindow(QMainWindow):
         self.session_connected.connect(self.add_terminal_tab)
         self.session_failed.connect(self.show_error_message)
         self.mfa_requested.connect(self.handle_mfa_request)
+        self.password_requested.connect(self.handle_password_request)
 
     def add_local_terminal_tab(self):
         """Add a local terminal tab (PowerShell on Windows)"""
@@ -66,6 +71,7 @@ class MainWindow(QMainWindow):
         # Create local session
         local_session = LocalSession("powershell.exe")
         if local_session.connect():
+            print("DEBUG: Local session connected successfully")
             settings = self.settings_manager.get_all()
             terminal = Terminal(local_session, settings)
             self.tabs.addTab(terminal, "Local Terminal")
@@ -74,6 +80,22 @@ class MainWindow(QMainWindow):
             # Connect session_closed signal to auto-close tab
             terminal.session_closed.connect(lambda: self.close_tab_by_widget(terminal))
         else:
+            print("DEBUG: Local session failed to connect")
+            
+            # Read debug log for user feedback
+            log_content = "Could not read debug log."
+            if os.path.exists("session_debug.log"):
+                try:
+                    with open("session_debug.log", "r") as f:
+                        # Get last 20 lines
+                        lines = f.readlines()
+                        log_content = "".join(lines[-20:])
+                except:
+                    pass
+            
+            QMessageBox.critical(self, "Local Terminal Error", 
+                                f"Failed to start local terminal.\n\nDebug Log:\n{log_content}")
+            
             # Fallback to empty tab if local terminal fails
             dummy = QWidget()
             dummy.setStyleSheet("background-color: #1e1e1e;")
@@ -109,7 +131,21 @@ class MainWindow(QMainWindow):
         
         # Extract proxy settings
         proxy_settings = data.get('proxy', {})
-        proxy_jump_settings = data.get('proxy_jump', {})
+        proxy_jump_settings = data.setdefault('proxy_jump', {'enabled': False})
+        
+        # Check for Jump Host password
+        if proxy_jump_settings and proxy_jump_settings.get("enabled"):
+            jump_user = proxy_jump_settings.get("username")
+            jump_host = proxy_jump_settings.get("host")
+            jump_pass = proxy_jump_settings.get("password")
+            
+            if not jump_pass:
+                jump_pass, ok = QInputDialog.getText(self, "Jump Host Password", f"Enter password for jump host {jump_user}@{jump_host}:", echo=QLineEdit.EchoMode.Password)
+                if not ok:
+                    return # User cancelled
+                proxy_jump_settings['password'] = jump_pass
+                # We don't necessarily need to save it to store unless we want persistence
+                # self.sidebar.update_jump_password(data, jump_pass) # TODO: add this if needed
 
         # Create session
         session = SSHSession(
@@ -119,34 +155,73 @@ class MainWindow(QMainWindow):
             password=password,
             proxy_settings=proxy_settings,
             proxy_jump_settings=proxy_jump_settings,
-            auth_callback=self.get_mfa_response
+            auth_callback=self.get_mfa_response,
+            password_callback=self.get_password_response
         )
         
         # Connect in a separate thread
         threading.Thread(target=self._connect_thread, args=(session, host), daemon=True).start()
 
+    def get_password_response(self, prompt):
+        """Thread-safe callback to get a new password from user"""
+        event_container = {"response": None, "event": threading.Event()}
+        self.password_requested.emit(prompt, event_container)
+        if not event_container["event"].wait(timeout=120):
+            return None
+        return event_container["response"]
+
+    def handle_password_request(self, prompt, event_container):
+        """Slot to handle password request on main thread"""
+        text, ok = QInputDialog.getText(self, "Authentication Failed", prompt, echo=QLineEdit.EchoMode.Password)
+        if ok:
+            event_container["response"] = text
+        else:
+            event_container["response"] = None
+        event_container["event"].set()
+
     def get_mfa_response(self, title, instructions, prompt_list):
         """
         Thread-safe callback for paramiko auth_interactive.
-        prompt_list is a list of (prompt_string, echo_bool) tuples.
         """
+        print(f"DEBUG: get_mfa_response called - Title: {title}, Instructions: {instructions}, Prompts: {len(prompt_list)}")
         responses = []
         for prompt, echo in prompt_list:
              # We need to ask the user on the main thread
              event_container = {"response": None, "event": threading.Event()}
-             self.mfa_requested.emit(prompt, event_container)
+             print(f"DEBUG: Emitting mfa_requested for prompt: {prompt}")
+             self.mfa_requested.emit(title, instructions, prompt, echo, event_container)
              # Wait for UI thread to process
-             event_container["event"].wait()
+             if not event_container["event"].wait(timeout=120): # 2 minute timeout
+                 print("DEBUG: MFA timeout reached")
+                 responses.append("")
+                 continue
+             print(f"DEBUG: Received MFA response: {'***' if not echo else event_container['response']}")
              responses.append(event_container["response"] or "")
         return responses
 
-    def handle_mfa_request(self, prompt, event_container):
+    def handle_mfa_request(self, title, instructions, prompt, echo, event_container):
         """Slot to handle MFA request on main thread"""
-        text, ok = QInputDialog.getText(self, "MFA Authentication", prompt, echo=QLineEdit.EchoMode.Normal)
+        print(f"MFA Request: {prompt}")
+        
+        # Format a nice message for the user
+        display_title = title or "MFA Authentication"
+        if instructions:
+            # If instructions are long, use them as the main text
+            display_prompt = f"{instructions}\n\n{prompt}"
+        else:
+            display_prompt = prompt
+
+        text, ok = QInputDialog.getText(
+            self, 
+            display_title,
+            display_prompt, 
+            echo=QLineEdit.EchoMode.Normal if echo else QLineEdit.EchoMode.Password
+        )
+        
         if ok:
             event_container["response"] = text
         else:
-            event_container["response"] = "" # Return empty string on cancel
+            event_container["response"] = ""
         event_container["event"].set()
 
     def _connect_thread(self, session, host):
@@ -180,6 +255,40 @@ class MainWindow(QMainWindow):
             if self.tabs.widget(i) == widget:
                 self.close_tab(i)
                 break
+
+    def create_toolbar(self):
+        """Create the main toolbar"""
+        self.toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(self.toolbar)
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        
+        from PyQt6.QtWidgets import QStyle
+        
+        # New SSH Session Action
+        ssh_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogStart)
+        ssh_action = QAction(ssh_icon, "New SSH", self)
+        ssh_action.setToolTip("Open Session Manager")
+        ssh_action.triggered.connect(self.open_session_manager)
+        self.toolbar.addAction(ssh_action)
+        
+        self.toolbar.addSeparator()
+        
+        # New Local Terminal Action
+        local_term_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        local_term_action = QAction(local_term_icon, "Local Terminal", self)
+        local_term_action.setToolTip("Open a new local terminal tab")
+        local_term_action.triggered.connect(self.add_local_terminal_tab)
+        self.toolbar.addAction(local_term_action)
+        
+        self.toolbar.addSeparator()
+        
+        # Settings Action
+        settings_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        settings_action = QAction(settings_icon, "Settings", self)
+        settings_action.setToolTip("Open application settings")
+        settings_action.triggered.connect(self.open_settings)
+        self.toolbar.addAction(settings_action)
 
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -246,9 +355,9 @@ class MainWindow(QMainWindow):
         from utils import resource_path
         
         if theme == "light":
-            stylesheet_path = resource_path("ui/style_light.qss")
+            stylesheet_path = resource_path("ui", "style_light.qss")
         else:
-            stylesheet_path = resource_path("ui/style.qss")
+            stylesheet_path = resource_path("ui", "style.qss")
         
         try:
             with open(stylesheet_path, "r") as f:

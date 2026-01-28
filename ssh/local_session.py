@@ -43,27 +43,33 @@ class LocalSession:
             # In frozen app, we may need to ensure binaries are in the PATH
             if getattr(sys, 'frozen', False):
                 base_path = sys._MEIPASS
-                winpty_bin_path = os.path.join(base_path, 'winpty')
                 
-                # Add both MEIPASS and winpty subfolder to PATH
-                new_paths = [base_path, winpty_bin_path]
-                for p in new_paths:
-                    if os.path.exists(p) and p not in os.environ['PATH']:
-                        os.environ['PATH'] = p + os.pathsep + os.environ['PATH']
+                # Add base_path to PATH if not already there
+                if base_path not in os.environ['PATH']:
+                     os.environ['PATH'] = base_path + os.pathsep + os.environ['PATH']
                 
+                # On Python 3.8+, we often need to explicitly add DLL directories
+                if hasattr(os, 'add_dll_directory'):
+                    try:
+                        os.add_dll_directory(base_path)
+                        # Also add a winpty subfolder if it exists
+                        if os.path.exists(os.path.join(base_path, 'winpty')):
+                            os.add_dll_directory(os.path.join(base_path, 'winpty'))
+                    except Exception as e:
+                        with open("session_debug.log", "a") as f:
+                            f.write(f"Failed to add DLL directory: {e}\n")
+
                 with open("session_debug.log", "a") as f:
                     f.write(f"Frozen mode. MEIPASS: {base_path}\n")
-                    f.write(f"winpty path: {winpty_bin_path}\n")
-                    # Check in root AND winpty subfolder
-                    f.write(f"winpty.dll (root) Exists: {os.path.exists(os.path.join(base_path, 'winpty.dll'))}\n")
-                    f.write(f"winpty.dll (bin) Exists: {os.path.exists(os.path.join(winpty_bin_path, 'winpty.dll'))}\n")
-                    f.write(f"winpty-agent.exe (root) Exists: {os.path.exists(os.path.join(base_path, 'winpty-agent.exe'))}\n")
-                    f.write(f"winpty-agent.exe (bin) Exists: {os.path.exists(os.path.join(winpty_bin_path, 'winpty-agent.exe'))}\n")
+                    f.write(f"winpty-agent.exe Exists: {os.path.exists(os.path.join(base_path, 'winpty-agent.exe'))}\n")
+                    f.write(f"OpenConsole.exe Exists: {os.path.exists(os.path.join(base_path, 'OpenConsole.exe'))}\n")
+                    f.write(f"conpty.dll Exists: {os.path.exists(os.path.join(base_path, 'conpty.dll'))}\n")
+                    f.write(f"PATH: {os.environ['PATH']}\n")
 
             # Import winpty AFTER setting up the environment
             import winpty
             with open("session_debug.log", "a") as f:
-                f.write("Successfully imported winpty\n")
+                f.write(f"Successfully imported winpty from: {winpty.__file__ if hasattr(winpty, '__file__') else 'unknown'}\n")
         except ImportError as e:
             with open("session_debug.log", "a") as f:
                 f.write(f"Failed to import winpty: {e}\n")
@@ -74,22 +80,59 @@ class LocalSession:
             # Create PTY with VT100 support enabled
             self.process = winpty.PTY(80, 24)  # cols, rows
             
-            # For PowerShell, we need to force VT100 mode
-            # We'll modify the shell command to set the environment and enable VT processing
-            if "powershell" in self.shell.lower():
-                # PowerShell command that enables VT100 processing
-                # $Host.UI.RawUI is used to enable VT100 escape sequences
-                shell_cmd = f'{self.shell} -NoLogo -Command "$Host.UI.RawUI.ForegroundColor = \'White\'; $Host.UI.RawUI.BackgroundColor = \'Black\'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $env:TERM = \'xterm-256color\'; powershell -NoExit"'
-            else:
-                shell_cmd = self.shell
+            # Use absolute path for shell if possible
+            import shutil
+            primary_shell = shutil.which(self.shell) or self.shell
             
-            self.process.spawn(shell_cmd)
+            # Fallback shells to try if primary fails
+            shells_to_try = [primary_shell]
+            if "powershell" in primary_shell.lower():
+                shells_to_try.append("cmd.exe")
+            
+            success = False
+            for shell_cmd in shells_to_try:
+                try:
+                    with open("session_debug.log", "a") as f:
+                        f.write(f"Attempting to spawn PTY with: {shell_cmd}\n")
+                    
+                    self.process.spawn(shell_cmd)
+                    
+                    # Check if it STAYS alive
+                    import time
+                    time.sleep(0.5)
+                    
+                    if self.process.isalive():
+                        with open("session_debug.log", "a") as f:
+                            f.write(f"Successfully spawned and confirmed alive: {shell_cmd}\n")
+                        success = True
+                        break
+                    else:
+                        exit_code = "unknown"
+                        try:
+                            exit_code = self.process.get_exitstatus()
+                        except: pass
+                        with open("session_debug.log", "a") as f:
+                            f.write(f"Shell {shell_cmd} exited immediately with code: {exit_code}\n")
+                        # If it failed, we'll try the next shell in the list
+                except Exception as spawn_err:
+                    with open("session_debug.log", "a") as f:
+                        f.write(f"Exception spawning {shell_cmd}: {spawn_err}\n")
+                    # Try next shell
+            
+            if not success:
+                raise RuntimeError("All shell spawn attempts failed or exited immediately.")
+
             self.running = True
-            with open("session_debug.log", "a") as f:
-                f.write(f"Successfully spawned PTY process with command: {shell_cmd}\n")
-        except Exception as spawn_err:
+        except Exception as err:
              with open("session_debug.log", "a") as f:
-                f.write(f"Failed to spawn PTY: {spawn_err}\n")
+                f.write(f"Setup error in _connect_pty: {err}\n")
+             raise
+        except BaseException as be:
+             # Catch low-level panics or other base exceptions
+             with open("session_debug.log", "a") as f:
+                f.write(f"CRITICAL: Caught BaseException during PTY setup: {be}\n")
+                if "Panic" in str(be):
+                    f.write("A low-level Panic occurred. This usually means winpty binaries are mismatched or missing.\n")
              raise
         
         # Start output reader thread
@@ -223,8 +266,14 @@ class LocalSession:
     def resize(self, rows, cols):
         """Resize the terminal"""
         try:
-            if self.use_pty and hasattr(self.process, 'set_size'):
-                self.process.set_size(cols, rows)
+            if self.use_pty and self.process and hasattr(self.process, 'set_size'):
+                # Handle cases where process might have died
+                try:
+                    self.process.set_size(cols, rows)
+                except Exception as inner_e:
+                    # Ignore "handle is invalid" if process is dying
+                    if "handle is invalid" not in str(inner_e).lower():
+                        print(f"Error calling set_size: {inner_e}")
         except Exception as e:
             print(f"Error resizing terminal: {e}")
     
