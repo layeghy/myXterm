@@ -8,7 +8,6 @@ venv/
 # Build and Dist
 build/
 dist/
-*.spec
 
 # Application specific
 secret.key
