@@ -1,5 +1,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QMenu, QMessageBox, QInputDialog
+from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt, pyqtSignal
+from utils import resource_path
 from .session_manager import SessionManager
 
 from .session_store import SessionStore
@@ -39,13 +41,17 @@ class Sidebar(QWidget):
         self.tree.clear()
         user_sessions = QTreeWidgetItem(self.tree)
         user_sessions.setText(0, "User Sessions")
+        from PyQt6.QtWidgets import QStyle
+        user_sessions.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         user_sessions.setExpanded(True)
         
         sessions = self.session_store.get_sessions()
+        terminal_icon = QIcon(resource_path("resources", "terminal.png"))
         for session in sessions:
             item = QTreeWidgetItem(user_sessions)
             name = session.get("name", f"{session['host']} ({session['username']})")
             item.setText(0, name)
+            item.setIcon(0, terminal_icon)
             item.setData(0, Qt.ItemDataRole.UserRole, session)
 
     def add_session(self, session_data):

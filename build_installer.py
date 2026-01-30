@@ -9,11 +9,21 @@ def build_installer():
     # Files
     sessions_file = "sessions.json"
     backup_file = "sessions.json.bak"
-    pyinstaller_path = os.path.join(".venv", "Scripts", "pyinstaller.exe")
+    # Try to find pyinstaller in a few common locations
+    venv_pyinstaller = os.path.join("venv", "Scripts", "pyinstaller.exe")
+    dot_venv_pyinstaller = os.path.join(".venv", "Scripts", "pyinstaller.exe")
+    
+    if os.path.exists(venv_pyinstaller):
+        pyinstaller_path = venv_pyinstaller
+    elif os.path.exists(dot_venv_pyinstaller):
+        pyinstaller_path = dot_venv_pyinstaller
+    else:
+        # Fallback to system PATH
+        pyinstaller_path = "pyinstaller"
     
     # Icon handling
-    icon_png = os.path.join("build", "resources", "icon.png")
-    icon_ico = os.path.join("build", "resources", "icon.ico")
+    icon_png = os.path.join("resources", "icon.png")
+    icon_ico = os.path.join("resources", "icon.ico")
     
     if os.path.exists(icon_png):
         print(f"Converting {icon_png} to .ico...")

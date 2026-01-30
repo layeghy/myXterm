@@ -9,7 +9,7 @@ def main():
     try:
         # Create QApplication FIRST - required before any QObjects
         app = QApplication(sys.argv)
-        app.setWindowIcon(QIcon(resource_path('build', 'resources', 'icon.ico')))
+        app.setWindowIcon(QIcon(resource_path('resources', 'icon.ico')))
         # Initialize settings manager (QObject requires QApplication to exist)
         from ui.settings_manager import SettingsManager
         settings_manager = SettingsManager()

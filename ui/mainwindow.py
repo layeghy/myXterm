@@ -67,6 +67,8 @@ class MainWindow(QMainWindow):
     def add_local_terminal_tab(self):
         """Add a local terminal tab (PowerShell on Windows)"""
         from ssh.local_session import LocalSession
+        from PyQt6.QtGui import QIcon
+        from utils import resource_path
         
         # Create local session
         local_session = LocalSession("powershell.exe")
@@ -74,7 +76,7 @@ class MainWindow(QMainWindow):
             print("DEBUG: Local session connected successfully")
             settings = self.settings_manager.get_all()
             terminal = Terminal(local_session, settings)
-            self.tabs.addTab(terminal, "Local Terminal")
+            self.tabs.addTab(terminal, QIcon(resource_path("resources", "terminal.png")), "Local Terminal")
             terminal.setFocus()
             
             # Connect session_closed signal to auto-close tab
@@ -234,9 +236,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Connection Error", message)
 
     def add_terminal_tab(self, session, host):
+        from PyQt6.QtGui import QIcon
+        from utils import resource_path
         settings = self.settings_manager.get_all()
         terminal = Terminal(session, settings)
-        self.tabs.addTab(terminal, host)
+        self.tabs.addTab(terminal, QIcon(resource_path("resources", "terminal.png")), host)
         self.tabs.setCurrentWidget(terminal)
         terminal.setFocus()
         
