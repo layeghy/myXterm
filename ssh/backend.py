@@ -19,6 +19,13 @@ class SSHSession:
         self.running = False
         self.jump_client = None # Keep reference to jump client
         self.jump_transport = None
+        
+        # Performance optimizations
+        self.buffer_size = 8192  # Start with 8KB
+        self.max_buffer_size = 32768  # Can grow to 32KB
+        self.reads_since_last_check = 0
+        self.enable_compression = True  # SSH compression for slow links
+
 
     def _smart_interactive_callback(self, title, instructions, prompt_list, username, password):
         """
@@ -147,8 +154,18 @@ class SSHSession:
                     sock=sock,
                     allow_agent=True,
                     look_for_keys=True,
-                    timeout=15
+                    timeout=15,
+                    compress=self.enable_compression  # Enable compression for better throughput
                 )
+                
+                # Get the transport and enable TCP keepalive for better connection stability
+                transport = self.client.get_transport()
+                if transport:
+                    transport.set_keepalive(60)  # Send keepalive every 60 seconds
+                    # Request larger TCP window for better throughput
+                    transport.window_size = 2097152  # 2MB window
+                    transport.packetizer.REKEY_BYTES = pow(2, 40)  # Avoid frequent rekeying
+                
                 self.shell = self.client.invoke_shell()
                 print(f"DEBUG: High-level connect successful for {self.host}")
             except (paramiko.AuthenticationException, paramiko.SSHException) as e:
@@ -194,9 +211,26 @@ class SSHSession:
             self.shell.send(command)
 
     def read_output(self):
+        """Read output with adaptive buffer sizing for optimal performance"""
         if self.shell and self.shell.recv_ready():
-            return self.shell.recv(1024).decode('utf-8')
+            # Adaptive buffer sizing: grow buffer if we're consistently reading full buffers
+            self.reads_since_last_check += 1
+            
+            # Every 10 reads, check if we should increase buffer size
+            if self.reads_since_last_check >= 10 and self.buffer_size < self.max_buffer_size:
+                # Increase buffer size for high-throughput connections
+                self.buffer_size = min(self.buffer_size * 2, self.max_buffer_size)
+                self.reads_since_last_check = 0
+                print(f"DEBUG: Increased buffer size to {self.buffer_size} bytes")
+            
+            try:
+                data = self.shell.recv(self.buffer_size)
+                return data.decode('utf-8', errors='replace')  # Replace invalid UTF-8 instead of crashing
+            except UnicodeDecodeError:
+                # Fallback for encoding issues
+                return data.decode('latin-1')
         return None
+
 
     def is_active(self):
         # Check if the shell channel is still open

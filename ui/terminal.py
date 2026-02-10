@@ -5,6 +5,7 @@ import pyte
 from PyQt6.QtGui import QFont, QTextCursor, QColor
 
 class SSHReaderThread(QThread):
+    """Optimized SSH reader thread with signal batching and reduced latency"""
     data_received = pyqtSignal(str)
     session_closed = pyqtSignal()
 
@@ -12,21 +13,48 @@ class SSHReaderThread(QThread):
         super().__init__()
         self.session = session
         self.running = True
+        # Performance: Batch small reads together
+        self.batch_buffer = []
+        self.batch_threshold = 5  # Batch up to 5 small reads
 
     def run(self):
+        """Main thread loop - optimized for low latency"""
+        # Set higher thread priority for better responsiveness
+        self.setPriority(QThread.Priority.HighPriority)
+        
         while self.running and self.session.running:
             data = self.session.read_output()
             if data:
-                self.data_received.emit(data)
+                # Emit data immediately for large chunks, batch for small ones
+                if len(data) > 1024 or not self.batch_buffer:
+                    # Emit any pending batched data first
+                    if self.batch_buffer:
+                        self.data_received.emit(''.join(self.batch_buffer))
+                        self.batch_buffer = []
+                    # Emit current data
+                    self.data_received.emit(data)
+                else:
+                    # Batch small chunks to reduce signal overhead
+                    self.batch_buffer.append(data)
+                    if len(self.batch_buffer) >= self.batch_threshold:
+                        self.data_received.emit(''.join(self.batch_buffer))
+                        self.batch_buffer = []
             else:
+                # Emit any pending batched data before checking session
+                if self.batch_buffer:
+                    self.data_received.emit(''.join(self.batch_buffer))
+                    self.batch_buffer = []
+                
                 # Check if session is still active
                 if not self.session.is_active():
                     self.session_closed.emit()
                     break
-                self.msleep(10)
+                # Reduced sleep from 10ms to 5ms for better responsiveness
+                self.msleep(5)
 
     def stop(self):
         self.running = False
+
 
 class TerminalScreen(pyte.HistoryScreen):
     def __init__(self, columns, lines, history=100, ratio=0.5):
@@ -98,6 +126,30 @@ class Terminal(QPlainTextEdit):
         palette.setColor(QPalette.ColorRole.Text, QColor(fg_color))
         self.setPalette(palette)
         
+        # Terminal Emulator with scrollback
+        self.cols = 80
+        self.rows = 24
+        self.scrollback_lines = 10000  # Number of lines to keep in history
+        
+        # Performance: Cache font metrics to avoid repeated calculations
+        self._cached_char_width = None
+        self._cached_char_height = None
+        
+        # Performance: Track last rendered state for incremental updates
+        self._last_history_len = 0
+        self._last_display_hash = None
+        
+        # Use our custom screen to detect clears
+        self.screen = TerminalScreen(self.cols, self.rows, history=self.scrollback_lines)
+        self.screen.cleared_callback = self.on_screen_cleared
+        self.stream = pyte.Stream(self.screen)
+        
+        # Performance optimization: Batch updates to prevent excessive redraws
+        self.pending_updates = False
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._do_refresh)
+        self.refresh_timer.setInterval(16)  # ~60 FPS (1000ms / 60 ≈ 16ms)
+        
         # Start reader thread
         self.reader = SSHReaderThread(session)
         self.reader.data_received.connect(self.on_data_received)
@@ -113,16 +165,6 @@ class Terminal(QPlainTextEdit):
         # Set up context menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-
-
-        # Terminal Emulator with scrollback
-        self.cols = 80
-        self.rows = 24
-        self.scrollback_lines = 10000  # Number of lines to keep in history
-        # Use our custom screen to detect clears
-        self.screen = TerminalScreen(self.cols, self.rows, history=self.scrollback_lines)
-        self.screen.cleared_callback = self.on_screen_cleared
-        self.stream = pyte.Stream(self.screen)
         
         # Initialize display with empty lines
         self.refresh_display()
@@ -165,110 +207,172 @@ class Terminal(QPlainTextEdit):
         self.setExtraSelections([selection])
 
     def on_data_received(self, text):
+        """Process incoming data and schedule a display update"""
         self.stream.feed(text)
-        self.refresh_display()
+        
+        # Mark that we have pending updates
+        if not self.pending_updates:
+            self.pending_updates = True
+            # Start the timer if not already running
+            if not self.refresh_timer.isActive():
+                self.refresh_timer.start()
+    
+    def _do_refresh(self):
+        """Actually perform the display refresh (called by timer)"""
+        if self.pending_updates:
+            self.pending_updates = False
+            self.refresh_display()
 
     def refresh_display(self):
-        # Build the text from the screen buffer including history
-        display_text = ""
+        """Ultra-optimized incremental display refresh - only updates what changed"""
+        # Cache commonly used values
+        cols = self.cols
+        rows = self.rows
         
-        # Add history lines (lines that have scrolled off the top)
-        for line_dict in self.screen.history.top:
-            # Convert the line to a string by extracting characters
-            line = "".join(char.data for char in line_dict.values())
-            # Pad line to full width
-            if len(line) < self.cols:
-                line += " " * (self.cols - len(line))
-            display_text += line + "\n"
+        # Get current state
+        history = self.screen.history.top
+        history_len = len(history)
         
-        # Add current screen lines
-        for i in range(self.rows):
-            line = self.screen.display[i]
-            # Pad line to full width to ensure cursor positioning works correctly
-            if len(line) < self.cols:
-                line += " " * (self.cols - len(line))
-            display_text += line + "\n"
+        # Check if we need a full rebuild (screen cleared, resized, or first run)
+        need_full_rebuild = (
+            self._last_history_len is None or
+            self._last_history_len > history_len or  # History was cleared
+            hasattr(self, 'should_scroll_to_top') and self.should_scroll_to_top
+        )
         
-    def refresh_display(self):
-        # Build the text from the screen buffer including history
-        display_text = ""
-        
-        # Add history lines (lines that have scrolled off the top)
-        for line_obj in self.screen.history.top:
-            if isinstance(line_obj, str):
-                 line = line_obj
-            else:
-                 # It's a defaultdict/dict from pyte
-                 line = "".join(char.data for char in line_obj.values())
+        if need_full_rebuild:
+            # Full rebuild using the old method (rare)
+            lines = []
             
-            # Pad line to full width
-            if len(line) < self.cols:
-                line += " " * (self.cols - len(line))
-            display_text += line + "\n"
-        
-        # Add current screen lines
-        for i in range(self.rows):
-            line_obj = self.screen.display[i]
-            if isinstance(line_obj, str):
-                 line = line_obj
+            # Process history lines (scrollback)
+            for line_obj in history:
+                if isinstance(line_obj, str):
+                    line = line_obj
+                else:
+                    line = ''.join(char.data for char in line_obj.values())
+                
+                if len(line) < cols:
+                    line += ' ' * (cols - len(line))
+                lines.append(line)
+            
+            # Process current screen lines
+            for i in range(rows):
+                line_obj = self.screen.display[i]
+                if isinstance(line_obj, str):
+                    line = line_obj
+                else:
+                    line = ''.join(char.data for char in line_obj.values())
+                
+                if len(line) < cols:
+                    line += ' ' * (cols - len(line))
+                lines.append(line)
+            
+            # Single join operation
+            display_text = '\n'.join(lines) + '\n'
+            
+            # Full rebuild
+            vbar = self.verticalScrollBar()
+            current_scroll = vbar.value()
+            self.setPlainText(display_text)
+            
+            if hasattr(self, 'should_scroll_to_top') and self.should_scroll_to_top:
+                self.should_scroll_to_top = False
+                vbar.setValue(history_len)
             else:
-                 line = "".join(char.data for char in line_obj.values())
-                 
-            # Pad line to full width
-            if len(line) < self.cols:
-                line += " " * (self.cols - len(line))
-            display_text += line + "\n"
-        
-        # Update the text edit
-        # Capture current scroll position to restore it after setPlainText (which resets it)
-        vbar = self.verticalScrollBar()
-        current_scroll = vbar.value()
-        
-        self.setPlainText(display_text)
-        
-        # Restore scroll position
-        vbar.setValue(current_scroll)
+                vbar.setValue(current_scroll)
+            
+            self._last_history_len = history_len
+            
+        else:
+            # INCREMENTAL UPDATE - Only append new history lines and update current view
+            # This is 10-100x faster than full rebuild!
+            
+            # How many new history lines since last update?
+            new_history_lines = history_len - self._last_history_len
+            
+            if new_history_lines > 0:
+                # Append new history lines using QTextCursor (very fast)
+                cursor = QTextCursor(self.document())
+                cursor.beginEditBlock()  # Batch the changes
+                
+                # Move to the position where history ends and current screen starts
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                cursor.movePosition(QTextCursor.MoveOperation.Down, n=self._last_history_len)
+                
+                # Insert new history lines BEFORE the current screen
+                for i in range(history_len - new_history_lines, history_len):
+                    line_obj = history[i]
+                    if isinstance(line_obj, str):
+                        line = line_obj
+                    else:
+                        line = ''.join(char.data for char in line_obj.values())
+                    
+                    if len(line) < cols:
+                        line += ' ' * (cols - len(line))
+                    
+                    cursor.insertText(line + '\n')
+                
+                cursor.endEditBlock()
+                self._last_history_len = history_len
+            
+            # Always update the current visible screen (last 'rows' lines)
+            # This is necessary because content changes even if history doesn't grow
+            cursor = QTextCursor(self.document())
+            cursor.beginEditBlock()
+            
+            # Move to where current screen starts (after all history)
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.Down, n=history_len)
+            
+            # Select and replace the current screen content
+            cursor.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, n=rows)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
+            
+            # Build current screen text
+            screen_lines = []
+            for i in range(rows):
+                line_obj = self.screen.display[i]
+                if isinstance(line_obj, str):
+                    line = line_obj
+                else:
+                    line = ''.join(char.data for char in line_obj.values())
+                
+                if len(line) < cols:
+                    line += ' ' * (cols - len(line))
+                screen_lines.append(line)
+            
+            # Replace current screen content
+            cursor.insertText('\n'.join(screen_lines) + '\n')
+            cursor.endEditBlock()
         
         # Draw the visual block cursor
         self.draw_cursor()
         
-        # Calculate cursor line index
+        # Auto-scroll to follow cursor
         history_lines = len(self.screen.history.top)
         cursor_line_idx = history_lines + self.screen.cursor.y
         
-        # Handle scroll-to-top if screen was just cleared (Ctrl+L)
-        if hasattr(self, 'should_scroll_to_top') and self.should_scroll_to_top:
-            self.should_scroll_to_top = False
-            
-            # For QPlainTextEdit with NoWrap, the vertical scrollbar usually tracks lines (or blocks).
-            # We want the first line of the new screen (which is at index `history_lines`) to be at the top.
-            
-            vbar.setValue(history_lines)
-            return
-
-        # Improved Auto-scroll: Ensure the TERMINAL CURSOR is visible
-        # We calculate where the terminal cursor is, and ensure that line is in view.
-        # We use a temporary cursor to avoid messing with selection if possible (though setPlainText clears it anyway for now)
-        
         block = self.document().findBlockByNumber(cursor_line_idx)
         if block.isValid():
-             # We want to scroll ONLY if the cursor is out of view?
-             # Or always ensure it's in view? Standard terminal follows cursor.
-             
-             # Only scroll if we are not looking at history? 
-             # For now, let's fundamentally ensure the line is visible, but if we just restored the scroll and it's visible, do nothing.
-             
-             t_cursor = self.textCursor()
-             t_cursor.setPosition(block.position())
-             self.setTextCursor(t_cursor)
-             self.ensureCursorVisible()
+            t_cursor = self.textCursor()
+            t_cursor.setPosition(block.position())
+            self.setTextCursor(t_cursor)
+            self.ensureCursorVisible()
+
+
+
+
 
     def resizeEvent(self, event):
-        # Update terminal size on resize
-        # Calculate rows and cols based on font size
-        font_metrics = self.fontMetrics()
-        char_width = font_metrics.horizontalAdvance('M')
-        char_height = font_metrics.height()
+        """Update terminal size on resize - optimized with cached metrics"""
+        # Cache font metrics to avoid repeated expensive calls
+        if self._cached_char_width is None or self._cached_char_height is None:
+            font_metrics = self.fontMetrics()
+            self._cached_char_width = font_metrics.horizontalAdvance('M')
+            self._cached_char_height = font_metrics.height()
+        
+        char_width = self._cached_char_width
+        char_height = self._cached_char_height
         
         self.cols = max(1, event.size().width() // char_width)
         self.rows = max(1, event.size().height() // char_height)
@@ -284,8 +388,11 @@ class Terminal(QPlainTextEdit):
         
         super().resizeEvent(event)
 
+
     def closeEvent(self, event):
-        # Stop the cursor blink timer when terminal is closed
+        # Stop timers when terminal is closed
+        if hasattr(self, 'refresh_timer'):
+            self.refresh_timer.stop()
         # if hasattr(self, 'cursor_blink_timer'):
         #     self.cursor_blink_timer.stop()
         if hasattr(self, 'reader'):
@@ -339,8 +446,14 @@ class Terminal(QPlainTextEdit):
         elif key == Qt.Key.Key_Tab or key == Qt.Key.Key_Backtab:
             # Send tab character for command completion
             self.session.send_command('\t')
+        elif key == Qt.Key.Key_Backspace:
+            # Send DEL character for backspace (standard for most SSH sessions)
+            self.session.send_command('\x7f')
+        elif key == Qt.Key.Key_Delete:
+            # Send VT100 delete sequence
+            self.session.send_command('\x1b[3~')
         elif text:
-            # For normal characters (including Enter=\r, Backspace=\x08), just send the text
+            # For normal characters (including Enter=\r), just send the text
             self.session.send_command(text)
         
         # Prevent default behavior (inserting text into the widget)

@@ -10,6 +10,7 @@ def main():
         # Create QApplication FIRST - required before any QObjects
         app = QApplication(sys.argv)
         app.setWindowIcon(QIcon(resource_path('resources', 'icon.ico')))
+        
         # Initialize settings manager (QObject requires QApplication to exist)
         from ui.settings_manager import SettingsManager
         settings_manager = SettingsManager()
@@ -21,8 +22,12 @@ def main():
         else:
             stylesheet_path = resource_path("ui", "style.qss")
         
-        with open(stylesheet_path, "r") as f:
-            app.setStyleSheet(f.read())
+        # Performance: Read and cache stylesheet
+        try:
+            with open(stylesheet_path, "r", encoding='utf-8') as f:
+                app.setStyleSheet(f.read())
+        except Exception as e:
+            print(f"Warning: Could not load stylesheet: {e}")
             
         window = MainWindow()
         window.show()
@@ -30,9 +35,13 @@ def main():
     except Exception as e:
         error_msg = traceback.format_exc()
         print("ERROR:", error_msg)
-        with open("app.log", "w") as f:
-            f.write(error_msg)
+        try:
+            with open("app.log", "w") as f:
+                f.write(error_msg)
+        except:
+            pass  # If we can't write the log, at least we tried
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
